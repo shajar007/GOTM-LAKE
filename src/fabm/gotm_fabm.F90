@@ -153,6 +153,15 @@
    integer :: repair_surface_count
    integer :: repair_bottom_count
 
+   ! Repair-mass diagnostic: mass added to each state variable by do_repair_state, integrated over the column
+   ! (pelagic: x Vc, bottom: x bottom area, surface: x Vc(nlev)/h(nlev)); unit = state unit x m3 (or m2).
+   ! Second index: 1 = after advection/diffusion, 2 = after time integration.
+   ! Repairs of intermediate Runge-Kutta stages (right_hand_side_rhs) change only the rates, not the stored state.
+   ! The totals are printed at the end of the run. repair_rate (both summed, per second of the last time step)
+   ! is the output <variable>_repaired, written only when requested in output.yaml.
+   REALTYPE,allocatable :: repair_mass_step(:,:),repair_mass_total(:,:)
+   REALTYPE,allocatable,target :: repair_rate(:)
+
    logical :: bottom_everywhere
    integer :: kmax_bot
 
@@ -521,6 +530,27 @@
          do i=1,size(model%surface_state_variables)
             call register_field(field_manager, model%surface_state_variables(i), data0d=cc(nlev,size(model%state_variables)+size(model%bottom_state_variables)+i), part_of_state=.true.)
          end do
+
+         if (repair_state) then
+            allocate(repair_rate(size(cc,2)))
+            repair_rate = _ZERO_
+            do i=1,size(model%state_variables)
+               call field_manager%register(trim(model%state_variables(i)%name)//'_repaired', &
+                  trim(model%state_variables(i)%units)//'*m3/s', 'mass added by repair_state to '//trim(model%state_variables(i)%long_name), &
+                  data0d=repair_rate(i), category='fabm', output_level=output_level_debug)
+            end do
+            do i=1,size(model%bottom_state_variables)
+               call field_manager%register(trim(model%bottom_state_variables(i)%name)//'_repaired', &
+                  trim(model%bottom_state_variables(i)%units)//'*m2/s', 'mass added by repair_state to '//trim(model%bottom_state_variables(i)%long_name), &
+                  data0d=repair_rate(size(model%state_variables)+i), category='fabm', output_level=output_level_debug)
+            end do
+            do i=1,size(model%surface_state_variables)
+               call field_manager%register(trim(model%surface_state_variables(i)%name)//'_repaired', &
+                  trim(model%surface_state_variables(i)%units)//'*m2/s', 'mass added by repair_state to '//trim(model%surface_state_variables(i)%long_name), &
+                  data0d=repair_rate(size(model%state_variables)+size(model%bottom_state_variables)+i), category='fabm', &
+                  output_level=output_level_debug)
+            end do
+         end if
 
          check_conservation = .false.
          do i=1,size(model%conserved_quantities)
@@ -1487,7 +1517,7 @@
    clock_start = clock_end
 
    ! Repair state before calling FABM
-   call do_repair_state(nlev,'gotm_fabm::do_gotm_fabm, after advection/diffusion')
+   call do_repair_state(nlev,'gotm_fabm::do_gotm_fabm, after advection/diffusion',1)
 
    do split=1,split_factor
       ! Update local light field (self-shading may have changed through changes in biological state variables)
@@ -1509,7 +1539,7 @@
       end do
 
       ! Repair state
-      call do_repair_state(nlev,'gotm_fabm::do_gotm_fabm, after time integration')
+      call do_repair_state(nlev,'gotm_fabm::do_gotm_fabm, after time integration',2)
    end do
 
    if (check_conservation) then
@@ -1522,6 +1552,14 @@
 
    if (associated(bio_albedo))     call fabm_get_albedo(model,bio_albedo)
    if (associated(bio_drag_scale)) call fabm_get_drag(model,bio_drag_scale)
+
+   ! Repair-mass diagnostic: mass added in this time step, per second (output <variable>_repaired)
+   if (allocated(repair_rate)) repair_rate = _ZERO_
+   if (allocated(repair_mass_step)) then
+      if (allocated(repair_rate)) repair_rate = (repair_mass_step(:,1) + repair_mass_step(:,2))/dt
+      repair_mass_total = repair_mass_total + repair_mass_step
+      repair_mass_step = _ZERO_
+   end if
 
    end subroutine do_gotm_fabm
 !EOC
@@ -1651,7 +1689,7 @@
 ! !IROUTINE: Check the current values of all state variables
 !
 ! !INTERFACE:
-   subroutine do_repair_state(nlev,location)
+   subroutine do_repair_state(nlev,location,measure_loc)
 !
 ! !DESCRIPTION:
 ! Checks the current values of all state variables and repairs these
@@ -1661,6 +1699,7 @@
 ! !INPUT PARAMETERS:
    integer,         intent(in) :: nlev
    character(len=*),intent(in) :: location
+   integer,optional,intent(in) :: measure_loc   ! repair-mass diagnostic: 1 = after transport, 2 = after integration
 !
 ! !REVISION HISTORY:
 !  Original author(s): Jorn Bruggeman
@@ -1668,9 +1707,15 @@
 ! !LOCAL VARIABLES:
    logical :: valid,tmpvalid
    integer :: i,k
+   integer :: count0
+   REALTYPE,allocatable :: cc_before(:,:)
 !EOP
 !-----------------------------------------------------------------------
 !BOC
+   if (present(measure_loc)) then
+      cc_before = cc(1:nlev,:)
+      count0 = repair_interior_count + repair_surface_count + repair_bottom_count
+   end if
    call fabm_check_state(model,1,nlev,repair_state,valid)
    if (repair_state.and..not.valid) repair_interior_count = repair_interior_count + 1
    if (valid .or. repair_state) then
@@ -1695,7 +1740,44 @@
       stop 'gotm_fabm::do_repair_state'
    end if
 
+   if (present(measure_loc)) then
+      if (repair_interior_count + repair_surface_count + repair_bottom_count > count0) &
+         call accumulate_repair_mass(nlev,measure_loc,cc_before)
+   end if
+
    end subroutine do_repair_state
+
+!-----------------------------------------------------------------------
+! Repair-mass diagnostic (local addition): column-integrated mass added by a repair
+   subroutine accumulate_repair_mass(nlev,iloc,cc_before)
+   integer, intent(in)  :: nlev,iloc
+   REALTYPE,intent(in)  :: cc_before(1:nlev,1:size(cc,2))
+   integer              :: i,k,n,nb
+   REALTYPE             :: area
+
+   n  = size(model%state_variables)
+   nb = size(model%bottom_state_variables)
+   if (.not. allocated(repair_mass_step)) then
+      allocate(repair_mass_step(size(cc,2),2));  repair_mass_step  = _ZERO_
+      allocate(repair_mass_total(size(cc,2),2)); repair_mass_total = _ZERO_
+   end if
+   do i=1,n
+      repair_mass_step(i,iloc) = repair_mass_step(i,iloc) + sum((cc(1:nlev,i)-cc_before(1:nlev,i))*Vc(1:nlev))
+   end do
+   do i=1,nb
+      do k=1,kmax_bot
+         if (k==1) then
+            area = Af(1)            ! as in right_hand_side_rhs: bottom flux * Af(1)/Vc(1)
+         else
+            area = Af(k)-Af(k-1)    ! bottom_everywhere: (Af(k)-Af(k-1))/Vc(k)
+         end if
+         repair_mass_step(n+i,iloc) = repair_mass_step(n+i,iloc) + (cc(k,n+i)-cc_before(k,n+i))*area
+      end do
+   end do
+   do i=n+nb+1,size(cc,2)
+      repair_mass_step(i,iloc) = repair_mass_step(i,iloc) + (cc(nlev,i)-cc_before(nlev,i))*Vc(nlev)/curh(nlev)
+   end do
+   end subroutine accumulate_repair_mass
 !EOC
 
 !-----------------------------------------------------------------------
@@ -1980,6 +2062,7 @@
 ! !LOCAL VARIABLES:
    integer(8) :: clock,ticks_per_sec
    REALTYPE :: tick_rate
+   integer :: i   ! repair-mass diagnostic (local addition)
 !EOP
 !-----------------------------------------------------------------------
 !BOC
@@ -1994,6 +2077,19 @@
       LEVEL1 'FABM interior state was repaired',repair_interior_count,'times.'
       LEVEL1 'FABM surface state was repaired',repair_surface_count,'times.'
       LEVEL1 'FABM bottom state was repaired',repair_bottom_count,'times.'
+      if (allocated(repair_mass_total)) then
+         LEVEL1 'Mass added by repair_state (state unit x m3 or m2): after transport, after integration'
+         do i=1,size(model%state_variables)
+            if (any(repair_mass_total(i,:) /= _ZERO_)) LEVEL2 trim(model%state_variables(i)%name),repair_mass_total(i,:)
+         end do
+         do i=1,size(model%bottom_state_variables)
+            if (any(repair_mass_total(size(model%state_variables)+i,:) /= _ZERO_)) &
+               LEVEL2 trim(model%bottom_state_variables(i)%name),repair_mass_total(size(model%state_variables)+i,:)
+         end do
+         LEVEL1 'Time series: <variable>_repaired in output.yaml'
+      else
+         LEVEL1 'repair_state did not change the stored state (no mass added).'
+      end if
    end if
 
    LEVEL1 'Time spent on advection of FABM variables:',clock_adv*tick_rate
