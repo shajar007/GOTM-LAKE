@@ -1724,6 +1724,7 @@
 ! !LOCAL VARIABLES:
    integer :: i,k,n
    type (type_bottom_diagnostic), pointer :: bottom_diagnostic_data
+   REALTYPE :: sflux_pel(1:size(model%state_variables))   ! surface fluxes, kept separate from the bottom fluxes in rhs(nlev)
 !EOP
 !-----------------------------------------------------------------------
 !BOC
@@ -1782,10 +1783,12 @@
 
    if (.not.no_surface) then
       ! Calculate temporal derivatives due to surface processes (e.g. gas exchange, ice algae).
-      call fabm_do_surface(model,rhs(nlev,1:n),rhs(nlev,n+size(model%bottom_state_variables)+1:))
+      ! fabm_do_surface sets its pelagic flux argument (intent(out)); computing it into a separate array
+      ! keeps the bottom fluxes already stored in rhs(nlev) for the top layer when bottom_everywhere is on.
+      call fabm_do_surface(model,sflux_pel,rhs(nlev,n+size(model%bottom_state_variables)+1:))
 
-      ! Distribute surface flux into pelagic over surface box (i.e., divide by layer height).
-      rhs(nlev,1:n) = rhs(nlev,1:n)/curh(nlev)
+      ! Distribute surface flux into pelagic over surface box (i.e., divide by layer height) and add.
+      rhs(nlev,1:n) = rhs(nlev,1:n) + sflux_pel/curh(nlev)
    end if
 
    ! Add pelagic sink and source terms for all depth levels.
