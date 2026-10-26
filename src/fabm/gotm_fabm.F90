@@ -165,6 +165,10 @@
    logical :: bottom_everywhere
    integer :: kmax_bot
 
+   ! Shoreline exchange of the benthic variables (bottom_everywhere with a moving water level): net mass
+   ! gained (+, flooded bed) or lost (-, exposed bed) per second in the last remapping, state unit x m2/s.
+   REALTYPE,allocatable,target :: shore_flux(:)
+
 !-----------------------------------------------------------------------
 
    contains
@@ -530,9 +534,17 @@
          do i=1,size(model%state_variables)
             call register_field(field_manager, model%state_variables(i), dimensions=(/id_dim_z/), data1d=cc(1:,i), part_of_state=.true.)
          end do
+         if (bottom_everywhere .and. .not. allocated(shore_flux)) then
+            allocate(shore_flux(size(model%bottom_state_variables)))
+            shore_flux = _ZERO_
+         end if
          do i=1,size(model%bottom_state_variables)
             if (bottom_everywhere) then
                call register_field(field_manager, model%bottom_state_variables(i), data1d=cc(1:,size(model%state_variables)+i), dimensions=(/id_dim_z/), part_of_state=.true.)
+               call field_manager%register(trim(model%bottom_state_variables(i)%name)//'_shoreline', &
+                  trim(model%bottom_state_variables(i)%units)//'*m2/s', &
+                  'shoreline exchange of '//trim(model%bottom_state_variables(i)%long_name)//' (+ flooded bed, - exposed bed)', &
+                  data0d=shore_flux(i), category='fabm')
             else
                call register_field(field_manager, model%bottom_state_variables(i), data0d=cc(1,size(model%state_variables)+i), part_of_state=.true.)
             end if
@@ -1387,6 +1399,9 @@
 !BOC
    if (.not. fabm_calc) return
 
+   ! Move the benthic content with the lake bed when the layer interfaces have moved (bottom_everywhere)
+   if (bottom_everywhere .and. gotm_lake) call remap_bottom_state(nlev)
+
    call calculate_derived_input(nlev,itime)
 
    ! Get updated vertical movement (m/s, positive for upwards) for biological state variables.
@@ -1572,6 +1587,65 @@
    end if
 
    end subroutine do_gotm_fabm
+!EOC
+
+!-----------------------------------------------------------------------
+!BOP
+!
+! !IROUTINE: Remap the benthic state after the layer interfaces have moved
+!
+! !INTERFACE:
+   subroutine remap_bottom_state(nlev)
+!
+! !DESCRIPTION:
+! With bottom_everywhere, layer k owns the strip of lake bed between the hypsograph areas Af(k-1) and
+! Af(k) (layer 1 includes the floor), and benthic variables are stored per m2 of that strip. When the
+! water level changes, the interfaces move along the bed and the strips change area. Keeping the content
+! per m2 would create or destroy benthic mass. The bed itself does not move, and a point of the bed has
+! a fixed hypsograph area, so the content is remapped in area coordinates: each new strip receives the
+! old contents in proportion to its overlap with the old strips. Bed that falls dry leaves the lake;
+! newly flooded bed receives the content per m2 of the old top layer. The net exchange is reported as
+! <variable>_shoreline. Without a change of the interface areas nothing happens.
+!
+! !INPUT PARAMETERS:
+   integer, intent(in) :: nlev
+!
+!EOP
+!
+! !LOCAL VARIABLES:
+   REALTYPE :: Ao(0:nlev), An(0:nlev), mass(1:nlev)
+   REALTYPE :: top_old, lo, hi, total_old
+   integer  :: i, j, k, n
+!-----------------------------------------------------------------------
+!BOC
+   if (.not. allocated(shore_flux)) allocate(shore_flux(size(model%bottom_state_variables)))
+   n = size(model%state_variables)
+   shore_flux = _ZERO_
+   Ao(0) = _ZERO_
+   An(0) = _ZERO_
+   Ao(1:nlev) = Afo(1:nlev)
+   An(1:nlev) = Af(1:nlev)
+   if (Ao(nlev) <= _ONE_) return              ! old areas not yet set (first call)
+   if (all(Ao == An)) return
+   top_old = max(Ao(nlev), An(nlev))          ! old top strip extended over newly flooded bed
+   do i=1,size(model%bottom_state_variables)
+      mass = _ZERO_
+      do k=1,nlev
+         do j=1,nlev
+            lo = max(An(k-1), Ao(j-1))
+            if (j == nlev) then
+               hi = min(An(k), top_old)
+            else
+               hi = min(An(k), Ao(j))
+            end if
+            if (hi > lo) mass(k) = mass(k) + cc(j,n+i)*(hi-lo)
+         end do
+      end do
+      total_old = sum(cc(1:nlev,n+i)*(Ao(1:nlev)-Ao(0:nlev-1)))
+      shore_flux(i) = (sum(mass) - total_old)/dt
+      cc(1:nlev,n+i) = mass/(An(1:nlev)-An(0:nlev-1))
+   end do
+   end subroutine remap_bottom_state
 !EOC
 
 !-----------------------------------------------------------------------
