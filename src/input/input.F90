@@ -558,7 +558,7 @@
                   self%one_profile = .true.
                   curvar => self%variables%first
                   do while (associated(curvar))
-                     curvar%p%data = self%prof1(:,curvar%p%index)
+                     curvar%p%data = curvar%p%scale_factor * self%prof1(:,curvar%p%index) + curvar%p%add_offset
                      curvar => curvar%next
                   end do
                else
@@ -571,12 +571,8 @@
             return
          end if
 
-         ! Apply offsets and scale factors to newly read profile
-         curvar => self%variables%first
-         do while (associated(curvar))
-            self%prof2(:,curvar%p%index) = curvar%p%scale_factor * self%prof2(:,curvar%p%index) + curvar%p%add_offset
-            curvar => curvar%next
-         end do
+         ! Scale factors and offsets are applied per variable when its data are set (below), not to the
+         ! shared array: several variables may read the same column of a file.
 
          self%nprofiles = self%nprofiles + 1
          call julian_day(yy,mm,dd,self%jul2)
@@ -594,7 +590,7 @@
    t = time_diff(jul,secs,self%jul1,self%secs1)
    curvar => self%variables%first
    do while (associated(curvar))
-      curvar%p%data = self%prof1(:,curvar%p%index) + t * self%alpha(:,curvar%p%index)
+      curvar%p%data = curvar%p%scale_factor * (self%prof1(:,curvar%p%index) + t * self%alpha(:,curvar%p%index)) + curvar%p%add_offset
       curvar => curvar%next
    end do
 
@@ -711,12 +707,8 @@
             call fatal_error('input::timeseries_file_update', 'End of file reached while attempting to read new data from '//trim(self%path)//'. Does this file span the entire simulated period?')
          end if
 
-         ! Apply offsets and scale factors to newly read data
-         curvar => self%variables%first
-         do while (associated(curvar))
-            self%obs2(curvar%p%index) = curvar%p%scale_factor * self%obs2(curvar%p%index) + curvar%p%add_offset
-            curvar => curvar%next
-         end do
+         ! Scale factors and offsets are applied per variable when its value is set (below), not to the
+         ! shared array: several variables may read the same column of a file.
 
          self%n = self%n + 1
          call julian_day(yy,mm,dd,self%jul2)
@@ -734,7 +726,7 @@
    t = time_diff(jul,secs,self%jul1,self%secs1)
    curvar => self%variables%first
    do while (associated(curvar))
-      curvar%p%value = min(max(self%obs1(curvar%p%index), self%obs2(curvar%p%index)), max(min(self%obs1(curvar%p%index), self%obs2(curvar%p%index)), self%obs1(curvar%p%index) + t * self%alpha(curvar%p%index)))
+      curvar%p%value = curvar%p%scale_factor * min(max(self%obs1(curvar%p%index), self%obs2(curvar%p%index)), max(min(self%obs1(curvar%p%index), self%obs2(curvar%p%index)), self%obs1(curvar%p%index) + t * self%alpha(curvar%p%index))) + curvar%p%add_offset
       curvar => curvar%next
    end do
 
