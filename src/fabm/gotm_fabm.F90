@@ -488,6 +488,16 @@
             stop "init_gotm_fabm: no valid ode_method specified in fabm.nml!"
       end select
 
+      ! GOTM-lake: the Patankar variants (4-11) use right_hand_side_ppdd, which couples the sediment to
+      ! layer 1 only (without the hypsograph factor and without bottom_everywhere) and has no surface
+      ! fluxes. Their results would be wrong, so they are not offered.
+      if (ode_method >= 4) then
+         FATAL 'ode_method 4-11 (Patankar variants) are not supported in GOTM-lake:'
+         FATAL 'right_hand_side_ppdd does not apply bottom_everywhere, the hypsograph or surface fluxes.'
+         FATAL 'Use ode_method 1-3 (Euler, Runge-Kutta 2 or 4).'
+         stop 'init_gotm_fabm'
+      end if
+
       ! Get ids for standard variables, to be used later to send data to FABM.
       temp_id = model%get_bulk_variable_id(standard_variables%temperature)
       salt_id = model%get_bulk_variable_id(standard_variables%practical_salinity)
