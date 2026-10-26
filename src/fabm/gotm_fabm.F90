@@ -153,8 +153,21 @@
    integer :: repair_surface_count
    integer :: repair_bottom_count
 
+   ! Repair-mass diagnostic: mass added to each state variable by do_repair_state, integrated over the column
+   ! (pelagic: x Vc, bottom: x bottom area, surface: x Vc(nlev)/h(nlev)); unit = state unit x m3 (or m2).
+   ! Second index: 1 = after advection/diffusion, 2 = after time integration.
+   ! Repairs of intermediate Runge-Kutta stages (right_hand_side_rhs) change only the rates, not the stored state.
+   ! The totals are printed at the end of the run. repair_rate (both summed, per second of the last time step)
+   ! is the output <variable>_repaired, written only when requested in output.yaml.
+   REALTYPE,allocatable :: repair_mass_step(:,:),repair_mass_total(:,:)
+   REALTYPE,allocatable,target :: repair_rate(:)
+
    logical :: bottom_everywhere
    integer :: kmax_bot
+
+   ! Shoreline exchange of the benthic variables (bottom_everywhere with a moving water level): net mass
+   ! gained (+, flooded bed) or lost (-, exposed bed) per second in the last remapping, state unit x m2/s.
+   REALTYPE,allocatable,target :: shore_flux(:)
 
 !-----------------------------------------------------------------------
 
@@ -479,6 +492,16 @@
             stop "init_gotm_fabm: no valid ode_method specified in fabm.nml!"
       end select
 
+      ! GOTM-lake: the Patankar variants (4-11) use right_hand_side_ppdd, which couples the sediment to
+      ! layer 1 only (without the hypsograph factor and without bottom_everywhere) and has no surface
+      ! fluxes. Their results would be wrong, so they are not offered.
+      if (ode_method >= 4) then
+         FATAL 'ode_method 4-11 (Patankar variants) are not supported in GOTM-lake:'
+         FATAL 'right_hand_side_ppdd does not apply bottom_everywhere, the hypsograph or surface fluxes.'
+         FATAL 'Use ode_method 1-3 (Euler, Runge-Kutta 2 or 4).'
+         stop 'init_gotm_fabm'
+      end if
+
       ! Get ids for standard variables, to be used later to send data to FABM.
       temp_id = model%get_bulk_variable_id(standard_variables%temperature)
       salt_id = model%get_bulk_variable_id(standard_variables%practical_salinity)
@@ -511,9 +534,17 @@
          do i=1,size(model%state_variables)
             call register_field(field_manager, model%state_variables(i), dimensions=(/id_dim_z/), data1d=cc(1:,i), part_of_state=.true.)
          end do
+         if (bottom_everywhere .and. .not. allocated(shore_flux)) then
+            allocate(shore_flux(size(model%bottom_state_variables)))
+            shore_flux = _ZERO_
+         end if
          do i=1,size(model%bottom_state_variables)
             if (bottom_everywhere) then
                call register_field(field_manager, model%bottom_state_variables(i), data1d=cc(1:,size(model%state_variables)+i), dimensions=(/id_dim_z/), part_of_state=.true.)
+               call field_manager%register(trim(model%bottom_state_variables(i)%name)//'_shoreline', &
+                  trim(model%bottom_state_variables(i)%units)//'*m2/s', &
+                  'shoreline exchange of '//trim(model%bottom_state_variables(i)%long_name)//' (+ flooded bed, - exposed bed)', &
+                  data0d=shore_flux(i), category='fabm')
             else
                call register_field(field_manager, model%bottom_state_variables(i), data0d=cc(1,size(model%state_variables)+i), part_of_state=.true.)
             end if
@@ -521,6 +552,27 @@
          do i=1,size(model%surface_state_variables)
             call register_field(field_manager, model%surface_state_variables(i), data0d=cc(nlev,size(model%state_variables)+size(model%bottom_state_variables)+i), part_of_state=.true.)
          end do
+
+         if (repair_state) then
+            allocate(repair_rate(size(cc,2)))
+            repair_rate = _ZERO_
+            do i=1,size(model%state_variables)
+               call field_manager%register(trim(model%state_variables(i)%name)//'_repaired', &
+                  trim(model%state_variables(i)%units)//'*m3/s', 'mass added by repair_state to '//trim(model%state_variables(i)%long_name), &
+                  data0d=repair_rate(i), category='fabm', output_level=output_level_debug)
+            end do
+            do i=1,size(model%bottom_state_variables)
+               call field_manager%register(trim(model%bottom_state_variables(i)%name)//'_repaired', &
+                  trim(model%bottom_state_variables(i)%units)//'*m2/s', 'mass added by repair_state to '//trim(model%bottom_state_variables(i)%long_name), &
+                  data0d=repair_rate(size(model%state_variables)+i), category='fabm', output_level=output_level_debug)
+            end do
+            do i=1,size(model%surface_state_variables)
+               call field_manager%register(trim(model%surface_state_variables(i)%name)//'_repaired', &
+                  trim(model%surface_state_variables(i)%units)//'*m2/s', 'mass added by repair_state to '//trim(model%surface_state_variables(i)%long_name), &
+                  data0d=repair_rate(size(model%state_variables)+size(model%bottom_state_variables)+i), category='fabm', &
+                  output_level=output_level_debug)
+            end do
+         end if
 
          check_conservation = .false.
          do i=1,size(model%conserved_quantities)
@@ -1347,6 +1399,9 @@
 !BOC
    if (.not. fabm_calc) return
 
+   ! Move the benthic content with the lake bed when the layer interfaces have moved (bottom_everywhere)
+   if (bottom_everywhere .and. gotm_lake) call remap_bottom_state(nlev)
+
    call calculate_derived_input(nlev,itime)
 
    ! Get updated vertical movement (m/s, positive for upwards) for biological state variables.
@@ -1487,7 +1542,7 @@
    clock_start = clock_end
 
    ! Repair state before calling FABM
-   call do_repair_state(nlev,'gotm_fabm::do_gotm_fabm, after advection/diffusion')
+   call do_repair_state(nlev,'gotm_fabm::do_gotm_fabm, after advection/diffusion',1)
 
    do split=1,split_factor
       ! Update local light field (self-shading may have changed through changes in biological state variables)
@@ -1509,7 +1564,7 @@
       end do
 
       ! Repair state
-      call do_repair_state(nlev,'gotm_fabm::do_gotm_fabm, after time integration')
+      call do_repair_state(nlev,'gotm_fabm::do_gotm_fabm, after time integration',2)
    end do
 
    if (check_conservation) then
@@ -1523,7 +1578,74 @@
    if (associated(bio_albedo))     call fabm_get_albedo(model,bio_albedo)
    if (associated(bio_drag_scale)) call fabm_get_drag(model,bio_drag_scale)
 
+   ! Repair-mass diagnostic: mass added in this time step, per second (output <variable>_repaired)
+   if (allocated(repair_rate)) repair_rate = _ZERO_
+   if (allocated(repair_mass_step)) then
+      if (allocated(repair_rate)) repair_rate = (repair_mass_step(:,1) + repair_mass_step(:,2))/dt
+      repair_mass_total = repair_mass_total + repair_mass_step
+      repair_mass_step = _ZERO_
+   end if
+
    end subroutine do_gotm_fabm
+!EOC
+
+!-----------------------------------------------------------------------
+!BOP
+!
+! !IROUTINE: Remap the benthic state after the layer interfaces have moved
+!
+! !INTERFACE:
+   subroutine remap_bottom_state(nlev)
+!
+! !DESCRIPTION:
+! With bottom_everywhere, layer k owns the strip of lake bed between the hypsograph areas Af(k-1) and
+! Af(k) (layer 1 includes the floor), and benthic variables are stored per m2 of that strip. When the
+! water level changes, the interfaces move along the bed and the strips change area. Keeping the content
+! per m2 would create or destroy benthic mass. The bed itself does not move, and a point of the bed has
+! a fixed hypsograph area, so the content is remapped in area coordinates: each new strip receives the
+! old contents in proportion to its overlap with the old strips. Bed that falls dry leaves the lake;
+! newly flooded bed receives the content per m2 of the old top layer. The net exchange is reported as
+! <variable>_shoreline. Without a change of the interface areas nothing happens.
+!
+! !INPUT PARAMETERS:
+   integer, intent(in) :: nlev
+!
+!EOP
+!
+! !LOCAL VARIABLES:
+   REALTYPE :: Ao(0:nlev), An(0:nlev), mass(1:nlev)
+   REALTYPE :: top_old, lo, hi, total_old
+   integer  :: i, j, k, n
+!-----------------------------------------------------------------------
+!BOC
+   if (.not. allocated(shore_flux)) allocate(shore_flux(size(model%bottom_state_variables)))
+   n = size(model%state_variables)
+   shore_flux = _ZERO_
+   Ao(0) = _ZERO_
+   An(0) = _ZERO_
+   Ao(1:nlev) = Afo(1:nlev)
+   An(1:nlev) = Af(1:nlev)
+   if (Ao(nlev) <= _ONE_) return              ! old areas not yet set (first call)
+   if (all(Ao == An)) return
+   top_old = max(Ao(nlev), An(nlev))          ! old top strip extended over newly flooded bed
+   do i=1,size(model%bottom_state_variables)
+      mass = _ZERO_
+      do k=1,nlev
+         do j=1,nlev
+            lo = max(An(k-1), Ao(j-1))
+            if (j == nlev) then
+               hi = min(An(k), top_old)
+            else
+               hi = min(An(k), Ao(j))
+            end if
+            if (hi > lo) mass(k) = mass(k) + cc(j,n+i)*(hi-lo)
+         end do
+      end do
+      total_old = sum(cc(1:nlev,n+i)*(Ao(1:nlev)-Ao(0:nlev-1)))
+      shore_flux(i) = (sum(mass) - total_old)/dt
+      cc(1:nlev,n+i) = mass/(An(1:nlev)-An(0:nlev-1))
+   end do
+   end subroutine remap_bottom_state
 !EOC
 
 !-----------------------------------------------------------------------
@@ -1651,7 +1773,7 @@
 ! !IROUTINE: Check the current values of all state variables
 !
 ! !INTERFACE:
-   subroutine do_repair_state(nlev,location)
+   subroutine do_repair_state(nlev,location,measure_loc)
 !
 ! !DESCRIPTION:
 ! Checks the current values of all state variables and repairs these
@@ -1661,6 +1783,7 @@
 ! !INPUT PARAMETERS:
    integer,         intent(in) :: nlev
    character(len=*),intent(in) :: location
+   integer,optional,intent(in) :: measure_loc   ! repair-mass diagnostic: 1 = after transport, 2 = after integration
 !
 ! !REVISION HISTORY:
 !  Original author(s): Jorn Bruggeman
@@ -1668,9 +1791,15 @@
 ! !LOCAL VARIABLES:
    logical :: valid,tmpvalid
    integer :: i,k
+   integer :: count0
+   REALTYPE,allocatable :: cc_before(:,:)
 !EOP
 !-----------------------------------------------------------------------
 !BOC
+   if (present(measure_loc)) then
+      cc_before = cc(1:nlev,:)
+      count0 = repair_interior_count + repair_surface_count + repair_bottom_count
+   end if
    call fabm_check_state(model,1,nlev,repair_state,valid)
    if (repair_state.and..not.valid) repair_interior_count = repair_interior_count + 1
    if (valid .or. repair_state) then
@@ -1695,7 +1824,44 @@
       stop 'gotm_fabm::do_repair_state'
    end if
 
+   if (present(measure_loc)) then
+      if (repair_interior_count + repair_surface_count + repair_bottom_count > count0) &
+         call accumulate_repair_mass(nlev,measure_loc,cc_before)
+   end if
+
    end subroutine do_repair_state
+
+!-----------------------------------------------------------------------
+! Repair-mass diagnostic (local addition): column-integrated mass added by a repair
+   subroutine accumulate_repair_mass(nlev,iloc,cc_before)
+   integer, intent(in)  :: nlev,iloc
+   REALTYPE,intent(in)  :: cc_before(1:nlev,1:size(cc,2))
+   integer              :: i,k,n,nb
+   REALTYPE             :: area
+
+   n  = size(model%state_variables)
+   nb = size(model%bottom_state_variables)
+   if (.not. allocated(repair_mass_step)) then
+      allocate(repair_mass_step(size(cc,2),2));  repair_mass_step  = _ZERO_
+      allocate(repair_mass_total(size(cc,2),2)); repair_mass_total = _ZERO_
+   end if
+   do i=1,n
+      repair_mass_step(i,iloc) = repair_mass_step(i,iloc) + sum((cc(1:nlev,i)-cc_before(1:nlev,i))*Vc(1:nlev))
+   end do
+   do i=1,nb
+      do k=1,kmax_bot
+         if (k==1) then
+            area = Af(1)            ! as in right_hand_side_rhs: bottom flux * Af(1)/Vc(1)
+         else
+            area = Af(k)-Af(k-1)    ! bottom_everywhere: (Af(k)-Af(k-1))/Vc(k)
+         end if
+         repair_mass_step(n+i,iloc) = repair_mass_step(n+i,iloc) + (cc(k,n+i)-cc_before(k,n+i))*area
+      end do
+   end do
+   do i=n+nb+1,size(cc,2)
+      repair_mass_step(i,iloc) = repair_mass_step(i,iloc) + (cc(nlev,i)-cc_before(nlev,i))*Vc(nlev)/curh(nlev)
+   end do
+   end subroutine accumulate_repair_mass
 !EOC
 
 !-----------------------------------------------------------------------
@@ -1724,6 +1890,7 @@
 ! !LOCAL VARIABLES:
    integer :: i,k,n
    type (type_bottom_diagnostic), pointer :: bottom_diagnostic_data
+   REALTYPE :: sflux_pel(1:size(model%state_variables))   ! surface fluxes, kept separate from the bottom fluxes in rhs(nlev)
 !EOP
 !-----------------------------------------------------------------------
 !BOC
@@ -1782,10 +1949,12 @@
 
    if (.not.no_surface) then
       ! Calculate temporal derivatives due to surface processes (e.g. gas exchange, ice algae).
-      call fabm_do_surface(model,rhs(nlev,1:n),rhs(nlev,n+size(model%bottom_state_variables)+1:))
+      ! fabm_do_surface sets its pelagic flux argument (intent(out)); computing it into a separate array
+      ! keeps the bottom fluxes already stored in rhs(nlev) for the top layer when bottom_everywhere is on.
+      call fabm_do_surface(model,sflux_pel,rhs(nlev,n+size(model%bottom_state_variables)+1:))
 
-      ! Distribute surface flux into pelagic over surface box (i.e., divide by layer height).
-      rhs(nlev,1:n) = rhs(nlev,1:n)/curh(nlev)
+      ! Distribute surface flux into pelagic over surface box (i.e., divide by layer height) and add.
+      rhs(nlev,1:n) = rhs(nlev,1:n) + sflux_pel/curh(nlev)
    end if
 
    ! Add pelagic sink and source terms for all depth levels.
@@ -1977,6 +2146,7 @@
 ! !LOCAL VARIABLES:
    integer(8) :: clock,ticks_per_sec
    REALTYPE :: tick_rate
+   integer :: i   ! repair-mass diagnostic (local addition)
 !EOP
 !-----------------------------------------------------------------------
 !BOC
@@ -1991,6 +2161,19 @@
       LEVEL1 'FABM interior state was repaired',repair_interior_count,'times.'
       LEVEL1 'FABM surface state was repaired',repair_surface_count,'times.'
       LEVEL1 'FABM bottom state was repaired',repair_bottom_count,'times.'
+      if (allocated(repair_mass_total)) then
+         LEVEL1 'Mass added by repair_state (state unit x m3 or m2): after transport, after integration'
+         do i=1,size(model%state_variables)
+            if (any(repair_mass_total(i,:) /= _ZERO_)) LEVEL2 trim(model%state_variables(i)%name),repair_mass_total(i,:)
+         end do
+         do i=1,size(model%bottom_state_variables)
+            if (any(repair_mass_total(size(model%state_variables)+i,:) /= _ZERO_)) &
+               LEVEL2 trim(model%bottom_state_variables(i)%name),repair_mass_total(size(model%state_variables)+i,:)
+         end do
+         LEVEL1 'Time series: <variable>_repaired in output.yaml'
+      else
+         LEVEL1 'repair_state did not change the stored state (no mass added).'
+      end if
    end if
 
    LEVEL1 'Time spent on advection of FABM variables:',clock_adv*tick_rate
